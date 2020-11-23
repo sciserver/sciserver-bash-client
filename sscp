@@ -1,0 +1,268 @@
+#!/bin/bash
+
+# Constants
+
+SSCP_URL_AUTH="https://apps.sciserver.org/login-portal/keystone/v3/tokens"
+SSCP_FILE_URL="https://apps.sciserver.org/fileservice/api/file"
+
+# Function definitions
+
+function print_error {
+    echo $@ >&2
+}
+
+function print_debug {
+    if [[ $SSCP_DEBUG == 1 ]]; then
+        echo $@ >&2
+    fi
+}
+
+function getpass {
+    read -s -p "SciServer password for $1: " password
+    echo "$password"
+}
+
+function auth_curl {
+    user=$1
+    password=$2
+
+    options="-s -i"
+    headers="-H \"Content-Type: application/json\""
+    json="{\"auth\":{\"identity\":{\"password\":{\"user\":{\"name\":\"$user\",\"password\":\"$password\"}}}}}"
+
+    cmd="curl $options $headers -d '$json' '$SSCP_URL_AUTH'"
+
+    print_debug "Calling curl to authenticate user"
+    print_debug "$cmd"
+    
+    eval "$cmd" | grep -oP "^X-Subject-Token: \K([a-f0-9]+)"
+}
+
+function auth {
+    user="$1"
+    password="$2"
+
+    print_debug "Authenticating to SciServer"
+
+    if [[ -z "$password" ]]; then
+        print_debug "No password is provided."
+        password=$(getpass "$user")
+    fi
+
+    token=$(auth_curl "$user" "$password")
+
+    if [[ -z "$token" ]]; then
+        print_error "User authentication failed."
+        exit 1
+    else
+        print_debug "User authenticated, token is $token"
+    fi
+
+    echo "$token"
+}
+
+function download {
+    user="$1"
+    token="$2"
+    source="$3"
+    target="$4"
+
+    options="-s"
+    headers="-H \"X-Auth-Token: $token\""
+
+    if [[ -d "$target" ]]; then
+        # If target is a directory, enter and use file name from URL
+        pushd "$target" >/dev/null
+        options="-O $options"
+
+        cmd="curl $options $headers '$SSCP_FILE_URL/$source'"
+
+        print_debug "Calling curl to save file into directory"
+        print_debug "$cmd"
+
+        eval "$cmd" 2>&2
+
+        popd >/dev/null
+    else
+        cmd="curl $options $headers '$SSCP_FILE_URL/$source'"
+
+        print_debug "Calling curl to download file."
+        print_debug "$cmd"
+
+        eval "$cmd" 1>$target 2>&2
+    fi
+}
+
+function upload {
+    user="$1"
+    token="$2"
+    source="$3"
+    target="$4"
+
+    options="-s -X PUT"
+    headers="-H \"X-Auth-Token: $token\""
+
+    cmd="curl $options $headers -T '$source' $SSCP_FILE_URL/$target"
+
+    print_debug "Calling curl to upload file."
+    print_debug "$cmd"
+
+    eval "$cmd"
+}
+
+function remove {
+    user="$1"
+    token="$2"
+    source="$3"
+
+    options="-s -X DELETE"
+    headers="-H \"X-Auth-Token: $token\""
+
+    cmd="curl $options $headers $SSCP_FILE_URL/$source"
+
+    print_debug "Calling curl to delete file."
+    print_debug "$cmd"
+
+    eval "$cmd"
+}
+
+###############################################################
+
+set -e
+
+SSCP_DEBUG=0
+SSCP_MODE=""
+SSCP_USER="$USER"
+SSCP_PASSWORD=""
+SSCP_TOKEN="$SSCP_TOKEN"
+
+# Parse command line arguments
+args=()
+
+while (( "$#" )); do
+    case "$1" in
+        -d|--debug)
+            SSCP_DEBUG=1
+            shift
+            ;;
+        -h|--help)
+            SSCP_MODE="help"
+            shift
+            ;;
+        -a|--auth)
+            SSCP_MODE="auth"
+            shift
+            ;;
+        -r|--remove)
+            SSCP_MODE="remove"
+            shift
+            ;;
+        -u|--user)
+            SSCP_USER="$2"
+            shift 2
+            ;;
+        -p|--pass)
+            SSCP_PASSWORD="$2"
+            shift 2
+            ;;
+        -t|--token)
+            SSCP_TOKEN="$2"
+            shift 2
+            ;;
+        --) # end argument parsing
+            shift
+            break
+            ;;
+        -*|--*=) # unsupported flags
+            echo "Error: Unsupported flag $1" >&2
+            exit 1
+            ;;
+        *) # preserve all other arguments
+            args+=("$1")
+            shift
+            ;;
+    esac
+done
+
+print_debug "Parsed arguments:"
+print_debug "    Debug mode:   $SSCP_DEBUG"
+print_debug "    User name:    $SSCP_USER"
+print_debug "    User token:   $SSCP_TOKEN"
+
+case "$SSCP_MODE" in
+    help)
+        echo "Use sscp to copy files between you local machine and SciServer"
+        echo "Authenticate:      source sscp -a -u username"
+        echo "Download example:  ./sscp ss:/Temporary/username/volume/public/example.txt ."
+        echo "Upload example:    ./sscp example.txt ss:/Temporary/username/volume/public/example.txt"
+        echo "Delete example:    ./sscp -r ss:/Temporary/username/volume/public/example.txt"
+        ;;
+    auth)
+        print_debug "Running in authentication-only mode."
+
+        # Authenticate always
+        SSCP_TOKEN="$(auth "$SSCP_USER" "$SSCP_PASSWORD")"
+        echo
+
+        # Export variables (file has to be sourced rather than executed)
+        export SSCP_USER
+        export SSCP_TOKEN
+
+        echo "User name and authentication token saved to SSCP_USER and SSCP_TOKEN."
+        ;;
+    remove)
+        print_debug "Running in remove mode."
+
+        if [[ ${#args} -lt 1 ]]; then
+            print_error "Not enough arguments."
+            exit 1
+        fi
+
+        SSCP_FILE_FROM="${args[0]}"
+        SSCP_FILE_FROM="${SSCP_FILE_FROM:3}"
+
+        # Authenticate if necessary
+        if [[ -z "$SSCP_TOKEN" ]]; then
+            SSCP_TOKEN="$(auth "$SSCP_USER" "$SSCP_PASSWORD")"
+            echo
+        fi
+
+        remove "$SSCP_USER" "$SSCP_TOKEN" "$SSCP_FILE_FROM"
+
+        ;;
+    *)
+        print_debug "Running in copy mode."
+
+        if [[ ${#args} -lt 2 ]]; then
+            print_error "Not enough arguments."
+            exit 1
+        fi
+
+        SSCP_FILE_FROM="${args[0]}"
+        SSCP_FILE_TO="${args[1]}"
+
+        # Authenticate if necessary
+        if [[ -z "$SSCP_TOKEN" ]]; then
+            SSCP_TOKEN="$(auth "$SSCP_USER" "$SSCP_PASSWORD")"
+            echo
+        fi
+
+        if [[ $SSCP_FILE_FROM =~ ^ss: && $SSCP_FILE_TO =~ ^ss: ]]; then
+            # Copy mode
+            print_error "Remote copy not supported."
+            exit 1
+        elif [[ $SSCP_FILE_FROM =~ ^ss: ]]; then
+            # Download mode
+            SSCP_FILE_FROM="${SSCP_FILE_FROM:3}"
+            download "$SSCP_USER" "$SSCP_TOKEN" "$SSCP_FILE_FROM" "$SSCP_FILE_TO"
+        elif [[ $SSCP_FILE_TO =~ ^ss: ]]; then
+            # Upload mode
+            SSCP_FILE_TO="${SSCP_FILE_TO:3}"
+            upload "$SSCP_USER" "$SSCP_TOKEN" "$SSCP_FILE_FROM" "$SSCP_FILE_TO"
+        else
+            # Local copy mode
+            print_error "Local copy not supported."
+            exit 1
+        fi
+        ;;
+esac
