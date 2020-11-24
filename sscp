@@ -128,7 +128,9 @@ function remove {
 
 ###############################################################
 
-set -e
+if [[ "$0" != "$BASH_SOURCE" ]]; then
+    set -e
+fi
 
 SSCP_DEBUG=0
 SSCP_MODE=""
@@ -266,3 +268,7 @@ case "$SSCP_MODE" in
         fi
         ;;
 esac
+
+if [[ "$0" != "$BASH_SOURCE" ]]; then
+    set +e
+fi
